@@ -1,2 +1,2 @@
-// Package gocheckpointcoordinator provides the starting point for the task.
+// 包级总览文档见 coordinator.go。
 package gocheckpointcoordinator
