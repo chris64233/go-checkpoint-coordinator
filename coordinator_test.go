@@ -821,3 +821,226 @@ func TestNewFileStoreMissingFileStartsEmpty(t *testing.T) {
 		t.Fatalf("fresh history = %+v, %v", hist, err)
 	}
 }
+
+// ---- round-2 edge cases ----------------------------------------------------
+
+// While a later round is pending with only part of the frozen set reported,
+// the previous completed checkpoint must remain the visible recovery point:
+// partially reported progress is never observable as a checkpoint.
+func TestPendingRoundDoesNotHidePreviousCheckpoint(t *testing.T) {
+	co := newTestCoordinator(newFakeClock())
+	members := []string{"a", "b", "c"}
+	mustRegister(t, co, "t1", members...)
+
+	mustStart(t, co, "t1", 0)
+	reportAll(t, co, "t1", 1, members)
+	first, err := co.GetLatestRecoverableCheckpoint("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Round 2 is open with two of three members reported.
+	mustStart(t, co, "t1", 0)
+	if _, err := co.Report("t1", 2, "a", 1, "d2a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := co.Report("t1", 2, "b", 2, "d2b"); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, err := co.GetLatestRecoverableCheckpoint("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.ID != first.ID || latest.Round != 1 {
+		t.Fatalf("pending round must not replace the last completed checkpoint: %+v", latest)
+	}
+
+	// History exposes the pending round and its partial reports, but never a
+	// manifest or a notification for it.
+	hist, err := co.GetCheckpointHistory("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 2 {
+		t.Fatalf("history len = %d, want 2", len(hist))
+	}
+	if hist[1].Round.Status != RoundPending {
+		t.Fatalf("history[1] status = %s, want pending", hist[1].Round.Status)
+	}
+	if hist[1].Manifest != nil {
+		t.Fatal("pending round must not carry a manifest")
+	}
+	if hist[1].Notification != nil {
+		t.Fatal("pending round must not carry a notification")
+	}
+	if got := len(hist[1].Round.Reports); got != 2 {
+		t.Fatalf("partial reports = %d, want 2", got)
+	}
+
+	// Completing round 2 atomically moves the recovery point forward.
+	finish, err := co.Report("t1", 2, "c", 3, "d2c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !finish.Completed {
+		t.Fatal("final report must complete round 2")
+	}
+	latest, _ = co.GetLatestRecoverableCheckpoint("t1")
+	if latest == nil || latest.Round != 2 {
+		t.Fatalf("recovery point = %+v, want round 2", latest)
+	}
+}
+
+// The deadline comparison is inclusive: a report arriving exactly at the
+// deadline loses to the timeout, so the report/timeout race has a
+// deterministic outcome at the boundary (only one terminal state survives).
+func TestDeadlineBoundaryReportLosesToTimeout(t *testing.T) {
+	clk := newFakeClock()
+	start := clk.now()
+	co := newTestCoordinator(clk)
+	mustRegister(t, co, "t1", "a")
+	mustStart(t, co, "t1", 10*time.Millisecond)
+
+	if got := clk.now().UnixMilli(); got != start.UnixMilli() {
+		t.Fatalf("clock moved unexpectedly: %v", got)
+	}
+
+	// Exactly at the deadline: timeout wins.
+	clk.advance(10 * time.Millisecond)
+	if _, err := co.Report("t1", 1, "a", 1, "d"); !errors.Is(err, ErrAlreadyTerminal) {
+		t.Fatalf("report at the deadline: want ErrAlreadyTerminal, got %v", err)
+	}
+	r, _ := co.GetRound("t1")
+	if r.Status != RoundTimedOut {
+		t.Fatalf("status = %s, want timed_out", r.Status)
+	}
+	notes, _ := co.Notifications("t1")
+	if len(notes) != 1 || notes[0].Status != RoundTimedOut || notes[0].ManifestID != "" {
+		t.Fatalf("boundary notification = %+v", notes)
+	}
+
+	// A report strictly before the deadline completes the round and survives:
+	// a fresh round is needed since the first one is terminal.
+	mustStart(t, co, "t1", 10*time.Millisecond)
+	clk.advance(-time.Millisecond) // now one millisecond before the new deadline
+	res, err := co.Report("t1", 2, "a", 1, "d")
+	if err != nil || !res.Completed {
+		t.Fatalf("report strictly before deadline must complete: err=%v res=%+v", err, res)
+	}
+	r2, _ := co.GetRound("t1")
+	if r2.Status != RoundCompleted {
+		t.Fatalf("status = %s, want completed", r2.Status)
+	}
+}
+
+// Abort, timeout advancement and the final report all race at once. Whatever
+// happens, the round ends with exactly one terminal status, one notification
+// and at most one manifest; failed outcomes must never become recovery points.
+func TestAbortTimeoutAndLastReportRace(t *testing.T) {
+	const iterations = 200
+	members := []string{"a", "b", "c"}
+
+	for iter := 0; iter < iterations; iter++ {
+		clk := newFakeClock()
+		co := newTestCoordinator(clk)
+		mustRegister(t, co, "task", members...)
+		mustStart(t, co, "task", 10*time.Millisecond)
+		// Every member except the last one has already reported.
+		reportAll(t, co, "task", 1, members[:len(members)-1])
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var reportRes *ReportResult
+		var reportErr, abortErr error
+		var timedOut []Round
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			<-start
+			reportRes, reportErr = co.Report("task", 1, "c", 30, "dc")
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, abortErr = co.AbortCheckpoint("task", "user abort")
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			clk.advance(time.Hour)
+			timedOut, _, _ = co.AdvanceTimeouts()
+		}()
+		close(start)
+		wg.Wait()
+
+		r, err := co.GetRound("task")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !r.Status.Terminal() {
+			t.Fatalf("iteration %d: round not terminal: %s", iter, r.Status)
+		}
+		notes, err := co.Notifications("task")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(notes) != 1 || notes[0].Status != r.Status {
+			t.Fatalf("iteration %d: status=%s notifications=%+v", iter, r.Status, notes)
+		}
+
+		switch r.Status {
+		case RoundCompleted:
+			if reportErr != nil || reportRes == nil || !reportRes.Completed {
+				t.Fatalf("iteration %d: completed but report err=%v res=%+v", iter, reportErr, reportRes)
+			}
+			if !errors.Is(abortErr, ErrAlreadyTerminal) {
+				t.Fatalf("iteration %d: completed but abort err=%v", iter, abortErr)
+			}
+			if len(timedOut) != 0 {
+				t.Fatalf("iteration %d: completed but timeout transitions=%d", iter, len(timedOut))
+			}
+			if notes[0].ManifestID == "" {
+				t.Fatalf("iteration %d: completed without manifest reference", iter)
+			}
+			mani, err := co.GetLatestRecoverableCheckpoint("task")
+			if err != nil || mani == nil || mani.ID != notes[0].ManifestID {
+				t.Fatalf("iteration %d: completed round must be recoverable: %+v %v", iter, mani, err)
+			}
+		case RoundAborted:
+			if abortErr != nil {
+				t.Fatalf("iteration %d: aborted but abort err=%v", iter, abortErr)
+			}
+			if len(timedOut) != 0 {
+				t.Fatalf("iteration %d: aborted but timeout transitions=%d", iter, len(timedOut))
+			}
+			if !errors.Is(reportErr, ErrAlreadyTerminal) {
+				t.Fatalf("iteration %d: lost report err=%v", iter, reportErr)
+			}
+			if notes[0].ManifestID != "" {
+				t.Fatalf("iteration %d: aborted notification references a manifest", iter)
+			}
+		case RoundTimedOut:
+			// The timeout may win either via AdvanceTimeouts or lazily inside
+			// the report call; both paths must leave the other two operations
+			// as losers.
+			if len(timedOut) > 1 {
+				t.Fatalf("iteration %d: %d timeout transitions, want 0 or 1", iter, len(timedOut))
+			}
+			if !errors.Is(reportErr, ErrAlreadyTerminal) {
+				t.Fatalf("iteration %d: lost report err=%v", iter, reportErr)
+			}
+			if !errors.Is(abortErr, ErrAlreadyTerminal) {
+				t.Fatalf("iteration %d: lost abort err=%v", iter, abortErr)
+			}
+			if notes[0].ManifestID != "" {
+				t.Fatalf("iteration %d: timed-out notification references a manifest", iter)
+			}
+		}
+		if r.Status != RoundCompleted {
+			if mani, _ := co.GetLatestRecoverableCheckpoint("task"); mani != nil {
+				t.Fatalf("iteration %d: failed round must not be recoverable", iter)
+			}
+		}
+	}
+}
