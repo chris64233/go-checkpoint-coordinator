@@ -420,6 +420,74 @@ func TestConcurrentLastReportsCompleteExactlyOnce(t *testing.T) {
 	}
 }
 
+// While a later round is pending with only part of the frozen set reported,
+// the previous completed checkpoint must remain the visible recovery point:
+// partially reported progress is never observable as a checkpoint.
+func TestPendingRoundDoesNotHidePreviousCheckpoint(t *testing.T) {
+	co := newTestCoordinator(newFakeClock())
+	members := []string{"a", "b", "c"}
+	mustRegister(t, co, "t1", members...)
+
+	mustStart(t, co, "t1", 0)
+	reportAll(t, co, "t1", 1, members)
+	first, err := co.GetLatestRecoverableCheckpoint("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Round 2 is open with two of three members reported.
+	mustStart(t, co, "t1", 0)
+	if _, err := co.Report("t1", 2, "a", 1, "d2a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := co.Report("t1", 2, "b", 2, "d2b"); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, err := co.GetLatestRecoverableCheckpoint("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.ID != first.ID || latest.Round != 1 {
+		t.Fatalf("pending round must not replace the last completed checkpoint: %+v", latest)
+	}
+
+	// History exposes the pending round and its partial reports, but never a
+	// manifest or a notification for it.
+	hist, err := co.GetCheckpointHistory("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 2 {
+		t.Fatalf("history len = %d, want 2", len(hist))
+	}
+	if hist[1].Round.Status != RoundPending {
+		t.Fatalf("history[1] status = %s, want pending", hist[1].Round.Status)
+	}
+	if hist[1].Manifest != nil {
+		t.Fatal("pending round must not carry a manifest")
+	}
+	if hist[1].Notification != nil {
+		t.Fatal("pending round must not carry a notification")
+	}
+	if got := len(hist[1].Round.Reports); got != 2 {
+		t.Fatalf("partial reports = %d, want 2", got)
+	}
+
+	// Completing round 2 atomically moves the recovery point forward.
+	finish, err := co.Report("t1", 2, "c", 3, "d2c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !finish.Completed {
+		t.Fatal("final report must complete round 2")
+	}
+	latest, _ = co.GetLatestRecoverableCheckpoint("t1")
+	if latest == nil || latest.Round != 2 {
+		t.Fatalf("recovery point = %+v, want round 2", latest)
+	}
+}
+
 // ---- terminal-state races --------------------------------------------------
 
 func TestAbortRacesWithLastReport(t *testing.T) {
@@ -583,6 +651,48 @@ func TestLazyTimeoutOnReport(t *testing.T) {
 	}
 }
 
+// The deadline comparison is inclusive: a report arriving exactly at the
+// deadline loses to the timeout, so the report/timeout race has a
+// deterministic outcome at the boundary (only one terminal state survives).
+func TestDeadlineBoundaryReportLosesToTimeout(t *testing.T) {
+	clk := newFakeClock()
+	start := clk.now()
+	co := newTestCoordinator(clk)
+	mustRegister(t, co, "t1", "a")
+	mustStart(t, co, "t1", 10*time.Millisecond)
+
+	if got := clk.now().UnixMilli(); got != start.UnixMilli() {
+		t.Fatalf("clock moved unexpectedly: %v", got)
+	}
+
+	// Exactly at the deadline: timeout wins.
+	clk.advance(10 * time.Millisecond)
+	if _, err := co.Report("t1", 1, "a", 1, "d"); !errors.Is(err, ErrAlreadyTerminal) {
+		t.Fatalf("report at the deadline: want ErrAlreadyTerminal, got %v", err)
+	}
+	r, _ := co.GetRound("t1")
+	if r.Status != RoundTimedOut {
+		t.Fatalf("status = %s, want timed_out", r.Status)
+	}
+	notes, _ := co.Notifications("t1")
+	if len(notes) != 1 || notes[0].Status != RoundTimedOut || notes[0].ManifestID != "" {
+		t.Fatalf("boundary notification = %+v", notes)
+	}
+
+	// A report strictly before the deadline completes the round and survives:
+	// a fresh round is needed since the first one is terminal.
+	mustStart(t, co, "t1", 10*time.Millisecond)
+	clk.advance(-time.Millisecond) // now one millisecond before the new deadline
+	res, err := co.Report("t1", 2, "a", 1, "d")
+	if err != nil || !res.Completed {
+		t.Fatalf("report strictly before deadline must complete: err=%v res=%+v", err, res)
+	}
+	r2, _ := co.GetRound("t1")
+	if r2.Status != RoundCompleted {
+		t.Fatalf("status = %s, want completed", r2.Status)
+	}
+}
+
 func TestAdvanceTimeoutsMultipleTasks(t *testing.T) {
 	clk := newFakeClock()
 	co := newTestCoordinator(clk)
@@ -625,6 +735,50 @@ func TestAbortTerminalRoundRejected(t *testing.T) {
 	}
 	if _, err := co.Report("t1", 1, "a", 1, "d"); !errors.Is(err, ErrAlreadyTerminal) {
 		t.Fatalf("report into aborted round: want ErrAlreadyTerminal, got %v", err)
+	}
+}
+
+// Aborting records the reason on the round and emits exactly one failure
+// notification with no manifest reference.
+func TestAbortRecordsReasonAndNotification(t *testing.T) {
+	clk := newFakeClock()
+	co := newTestCoordinator(clk)
+	mustRegister(t, co, "t1", "a", "b")
+	mustStart(t, co, "t1", 0)
+	if _, err := co.Report("t1", 1, "a", 1, "da"); err != nil {
+		t.Fatal(err)
+	}
+
+	abortAt := clk.now().UnixMilli()
+	r, n, err := co.AbortCheckpoint("t1", "operator requested stop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != RoundAborted || r.Reason != "operator requested stop" {
+		t.Fatalf("aborted round = %+v", r)
+	}
+	if r.ManifestID != "" || r.CompletedAt != abortAt {
+		t.Fatalf("aborted round manifest=%q completedAt=%d", r.ManifestID, r.CompletedAt)
+	}
+	if n == nil || n.Status != RoundAborted || n.ManifestID != "" || n.ID != r.NotificationID {
+		t.Fatalf("abort notification = %+v", n)
+	}
+
+	// The accepted report remains visible in the failed round's state, but no
+	// manifest exists for it.
+	if got := len(r.Reports); got != 1 {
+		t.Fatalf("aborted round reports = %d, want 1 retained", got)
+	}
+	notes, err := co.Notifications("t1")
+	if err != nil || len(notes) != 1 || notes[0].ID != n.ID {
+		t.Fatalf("notifications after abort: %v %+v", err, notes)
+	}
+	hist, err := co.GetCheckpointHistory("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 1 || hist[0].Manifest != nil || hist[0].Notification.ID != n.ID {
+		t.Fatalf("history after abort = %+v", hist)
 	}
 }
 
@@ -819,5 +973,98 @@ func TestNewFileStoreMissingFileStartsEmpty(t *testing.T) {
 	hist, err := co.GetCheckpointHistory("t1")
 	if err != nil || len(hist) != 0 {
 		t.Fatalf("fresh history = %+v, %v", hist, err)
+	}
+}
+
+// A timed-out round stays a failed round across restart: it keeps its status,
+// reason and notification, accepts no reports, and the next round opened after
+// reopening continues the monotonic numbering.
+func TestTimedOutRoundSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	members := []string{"a", "b"}
+
+	clk := newFakeClock()
+	co, err := NewWithStore(newFileStore(path), &Options{Clock: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, co, "t1", members...)
+
+	// Round 1 completes; round 2 times out.
+	mustStart(t, co, "t1", 0)
+	reportAll(t, co, "t1", 1, members)
+	if _, err := co.StartCheckpoint("t1", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(2 * time.Second)
+	if _, _, err := co.AdvanceTimeouts(); err != nil {
+		t.Fatal(err)
+	}
+	notes, err := co.Notifications("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notes) != 2 || notes[1].Status != RoundTimedOut {
+		t.Fatalf("notifications before restart = %+v", notes)
+	}
+
+	co, err = NewWithStore(newFileStore(path), &Options{Clock: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := co.GetRound("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != RoundTimedOut || r.Reason == "" {
+		t.Fatalf("round after restart = %+v", r)
+	}
+
+	// The failed round still refuses reports and is not a recovery point.
+	if _, err := co.Report("t1", 2, "b", 2, "db"); !errors.Is(err, ErrAlreadyTerminal) {
+		t.Fatalf("report into restarted timed-out round: want ErrAlreadyTerminal, got %v", err)
+	}
+	mani, err := co.GetLatestRecoverableCheckpoint("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mani == nil || mani.Round != 1 {
+		t.Fatalf("recoverable checkpoint after restart = %+v, want round 1", mani)
+	}
+
+	hist, err := co.GetCheckpointHistory("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 2 {
+		t.Fatalf("history after restart len = %d, want 2", len(hist))
+	}
+	if hist[0].Round.Status != RoundCompleted || hist[1].Round.Status != RoundTimedOut {
+		t.Fatalf("history after restart = %+v %+v", hist[0].Round.Status, hist[1].Round.Status)
+	}
+	if hist[1].Manifest != nil || hist[1].Notification == nil {
+		t.Fatalf("timed-out history entry = manifest %+v notification %+v", hist[1].Manifest, hist[1].Notification)
+	}
+
+	// A further round keeps numbering monotonic and can complete normally.
+	next, err := co.StartCheckpoint("t1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Number != 3 {
+		t.Fatalf("round number after restart = %d, want 3", next.Number)
+	}
+	for i, m := range members {
+		if _, err := co.Report("t1", 3, m, int64(i), "d3-"+m); err != nil {
+			t.Fatalf("report in post-restart round: %v", err)
+		}
+	}
+	latest, err := co.GetLatestRecoverableCheckpoint("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.Round != 3 {
+		t.Fatalf("recovery point after round 3 = %+v, want round 3", latest)
 	}
 }
