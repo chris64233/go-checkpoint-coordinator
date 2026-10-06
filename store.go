@@ -37,6 +37,8 @@ type persistedSnapshot struct {
 	Rounds        []*Round                   `json:"rounds"`
 	Manifests     map[string]*Manifest       `json:"manifests"`
 	Notifications map[string][]*Notification `json:"notifications"`
+	Branches      []*Branch                  `json:"branches,omitempty"`
+	Merges        []*MergeRecord             `json:"merges,omitempty"`
 }
 
 func (s *fileStore) load() (*snapshot, error) {
@@ -62,6 +64,8 @@ func (s *fileStore) load() (*snapshot, error) {
 		snap.Notifications = p.Notifications
 	}
 	snap.Rounds = p.Rounds
+	snap.Branches = p.Branches
+	snap.Merges = p.Merges
 	return snap, nil
 }
 
@@ -75,6 +79,8 @@ func (s *fileStore) save(snap *snapshot) error {
 		Rounds:        snap.Rounds,
 		Manifests:     snap.Manifests,
 		Notifications: snap.Notifications,
+		Branches:      snap.Branches,
+		Merges:        snap.Merges,
 	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
