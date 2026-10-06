@@ -133,6 +133,10 @@ type snapshot struct {
 	Manifests map[string]*Manifest
 	// Notifications are stored per task in ascending round order.
 	Notifications map[string][]*Notification
+	// Branches holds all processing branches.
+	Branches []*Branch
+	// Merges holds all merge records in decision order.
+	Merges []*MergeRecord
 }
 
 func newSnapshot() *snapshot {

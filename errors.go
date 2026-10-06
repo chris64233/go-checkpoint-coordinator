@@ -28,4 +28,26 @@ var (
 	// ErrAlreadyTerminal is returned when an operation (report, abort) targets
 	// a round that already has a terminal state.
 	ErrAlreadyTerminal = errors.New("round already reached a terminal state")
+	// ErrParentNotComplete is returned when creating a branch whose parent
+	// checkpoint round has not completed yet.
+	ErrParentNotComplete = errors.New("parent checkpoint round is not completed")
+	// ErrInvalidRange is returned when a branch processing range is empty or
+	// inverted.
+	ErrInvalidRange = errors.New("branch range is empty or inverted")
+	// ErrBranchExists is returned when creating a branch whose number is
+	// already in use for the task.
+	ErrBranchExists = errors.New("branch already exists for task")
+	// ErrBranchNotFound is returned when a referenced branch does not exist.
+	ErrBranchNotFound = errors.New("branch not found")
+	// ErrBranchNotOpen is returned when an operation targets a branch that is
+	// no longer open (e.g. already merged).
+	ErrBranchNotOpen = errors.New("branch is not open")
+	// ErrStaleGeneration is returned when a branch report carries a generation
+	// older than the branch's current generation; stale receipts never write
+	// back to the mainline.
+	ErrStaleGeneration = errors.New("branch report generation is stale")
+	// ErrMergeConflict is returned when a merge detects divergent prefixes or
+	// overlapping ranges; the returned MergeRecord carries the exact conflict
+	// positions.
+	ErrMergeConflict = errors.New("branch merge conflict")
 )

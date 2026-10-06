@@ -64,6 +64,26 @@ func cloneNotification(n *Notification) *Notification {
 	return &cp
 }
 
+func cloneBranch(b *Branch) *Branch {
+	if b == nil {
+		return nil
+	}
+	cp := *b
+	return &cp
+}
+
+func cloneMergeRecord(m *MergeRecord) *MergeRecord {
+	if m == nil {
+		return nil
+	}
+	cp := *m
+	if m.Conflicts != nil {
+		cp.Conflicts = make([]MergeConflict, len(m.Conflicts))
+		copy(cp.Conflicts, m.Conflicts)
+	}
+	return &cp
+}
+
 // cloneSnapshot deep-copies every reachable part of snap.
 func cloneSnapshot(snap *snapshot) *snapshot {
 	cp := newSnapshot()
@@ -83,6 +103,12 @@ func cloneSnapshot(snap *snapshot) *snapshot {
 		sort.Slice(cp.Notifications[taskID], func(i, j int) bool {
 			return cp.Notifications[taskID][i].Round < cp.Notifications[taskID][j].Round
 		})
+	}
+	for _, b := range snap.Branches {
+		cp.Branches = append(cp.Branches, cloneBranch(b))
+	}
+	for _, m := range snap.Merges {
+		cp.Merges = append(cp.Merges, cloneMergeRecord(m))
 	}
 	return cp
 }

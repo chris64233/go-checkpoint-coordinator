@@ -67,7 +67,31 @@ pending ──全部成员上报──▶ completed（生成清单 + 完成通�
 - 每次变更后把全部状态写成一个 JSON 文件：先写同目录临时文件 → `fsync` → `rename`
   原子替换 → 目录 `fsync`，任何时刻文件要么是旧版本要么是新版本，不会读到半截内容。
   用 `New(path)` 重新打开即可恢复；写入失败会回滚内存状态并向调用者返回错误，
-  协调器不会对外暴露未持久化成功的状态。
+协调器不会对外暴露未持久化成功的状态。
+
+### 6. 分支检查点合并
+
+同一任务可以从一个**已确认（completed）**检查点分出两条处理分支，各自推进后再合并回主线：
+
+- `CreateBranch(taskID, parentRound, branchNo, rangeStart, rangeEnd)`：从父检查点分支出一条
+  处理分支。分支记录**父检查点轮次、分支编号、处理范围 `[rangeStart, rangeEnd)` 和当前代次**
+  （初始为 1）。父检查点未完成时返回 `ErrParentNotComplete`，不能创建可发布分支；范围为空或
+  倒置返回 `ErrInvalidRange`；分支编号在任务内唯一。
+- `ReportBranch(taskID, branchNo, generation, position, digest)`：分支上报处理回执。代次必须
+  不小于分支当前代次——**旧代次回执返回 `ErrStaleGeneration`，绝不回写主线**；同代次同内容
+  幂等返回，同代次不同内容返回 `ErrConflict`。
+- `MergeBranches(taskID, mergeID, branchA, branchB)`：把两条分支合并回主线。合并前**重新确认
+  共同前缀**（两条分支必须来自同一父检查点）**和范围不重叠**；任何差异都返回
+  `ErrMergeConflict` 并在 `MergeRecord.Conflicts` 中给出**具体冲突位置**（父轮次不一致的位置
+  或重叠区间的起点），绝不静默覆盖。合并成功时原子地发布**恰好一个**新主线轮次（含清单与
+  通知），两条分支置为 `merged`；合并失败时两条分支都保留为 `open`，供修正后重试。
+- 分支上报、合并申请和新检查点发布都在同一把互斥锁内串行化：**并发时只有一个主线版本生效**；
+  有 pending 轮次时合并返回 `ErrRoundOpen`，不会悄悄顶掉进行中的检查点。
+- `mergeID` 是幂等键：**同一合并号重复提交返回原结果**（不会发布第二个主线版本）；同一合并号
+  但分支或范围发生变化返回 `ErrConflict`。
+- `GetBranches(taskID)` 按代次稳定排序（代次升序、同代次按分支编号）展示父子检查点与分支
+  范围；`GetMergeHistory(taskID)` 展示每次合并的冲突位置与最终主线版本。分支与合并记录同样
+  随快照原子持久化，重启后可恢复。
 
 ## 快速开始
 
@@ -129,12 +153,19 @@ func main() {
 | `GetLatestRecoverableCheckpoint(taskID)` | 最新成功检查点（失败/pending 轮次不可见） |
 | `GetCheckpointHistory(taskID)` | 全部轮次历史（含清单与通知） |
 | `GetTask` / `GetRound` / `GetManifest` / `Notifications` | 单项查询 |
+| `CreateBranch(taskID, parentRound, branchNo, start, end)` | 从已完成检查点分出处理分支 |
+| `ReportBranch(taskID, branchNo, generation, position, digest)` | 分支上报；旧代次回执被拒 |
+| `MergeBranches(taskID, mergeID, branchA, branchB)` | 校验共同前缀与范围后合并回主线，幂等 |
+| `GetBranches(taskID)` / `GetMergeHistory(taskID)` | 分支与合并历史查询（含冲突位置、主线版本） |
 
 ## 错误哨兵
 
 `ErrTaskExists`、`ErrTaskNotFound`、`ErrEmptyMembers`、`ErrRoundOpen`、`ErrNoRound`、
 `ErrUnknownMember`、`ErrStaleRound`、`ErrConflict`、`ErrAlreadyTerminal`，均可用
 `errors.Is` 判定。
+
+分支合并相关：`ErrParentNotComplete`、`ErrInvalidRange`、`ErrBranchExists`、
+`ErrBranchNotFound`、`ErrBranchNotOpen`、`ErrStaleGeneration`、`ErrMergeConflict`。
 
 ## 并发模型
 
@@ -156,3 +187,8 @@ go test -race -count=1 ./...
 8 成员 100 轮并发最后上报只完成一次（含持续读者校验无部分结果可见）、中止与最后上报
 200 轮竞争、超时与最后上报 200 轮竞争、懒超时与批量超时推进、失败轮次不作恢复点与
 历史查询、文件存储重启恢复、写入失败回滚等。
+
+分支合并覆盖：父检查点未完成拒绝分支、分支范围校验、旧代次回执不回写、同代次幂等/冲突、
+范围重叠与父轮次不一致的冲突位置、合并失败保留两条分支、合并发布唯一主线版本、合并与分支
+上报并发竞态（`-race`）、同一合并号重复提交幂等与键冲突、pending 轮次阻止合并、分支按代次
+稳定排序与重启恢复。
