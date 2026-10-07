@@ -13,4 +13,15 @@
 //
 // All state is persisted atomically to disk after every mutation, so a
 // coordinator can be reopened at the same path and resume.
+//
+// A confirmed checkpoint can fork processing branches (CreateBranch): each
+// branch records its parent checkpoint, a branch number, its processing range
+// and a generation that advances on every branch report. Branches can only be
+// created from completed checkpoints. RequestMerge folds two branches back into
+// the main line after reconfirming a shared common prefix and disjoint
+// ranges; every disagreement is reported as a concrete conflict rather than
+// silently overwritten. A caller-supplied merge id makes submissions
+// idempotent, a successful merge publishes exactly one mainline version, and
+// merged branches reject further receipts so stale branch reports can never be
+// written back to the main line.
 package gocheckpointcoordinator

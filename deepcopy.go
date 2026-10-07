@@ -64,6 +64,38 @@ func cloneNotification(n *Notification) *Notification {
 	return &cp
 }
 
+func cloneBranch(b *Branch) *Branch {
+	if b == nil {
+		return nil
+	}
+	cp := *b
+	return &cp
+}
+
+func cloneMergeRequest(req *MergeRequest) *MergeRequest {
+	if req == nil {
+		return nil
+	}
+	cp := *req
+	if req.Conflicts != nil {
+		cp.Conflicts = make([]Conflict, len(req.Conflicts))
+		copy(cp.Conflicts, req.Conflicts)
+	}
+	return &cp
+}
+
+func cloneMainlineVersion(v *MainlineVersion) *MainlineVersion {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	if v.Ranges != nil {
+		cp.Ranges = make([]Range, len(v.Ranges))
+		copy(cp.Ranges, v.Ranges)
+	}
+	return &cp
+}
+
 // cloneSnapshot deep-copies every reachable part of snap.
 func cloneSnapshot(snap *snapshot) *snapshot {
 	cp := newSnapshot()
@@ -83,6 +115,21 @@ func cloneSnapshot(snap *snapshot) *snapshot {
 		sort.Slice(cp.Notifications[taskID], func(i, j int) bool {
 			return cp.Notifications[taskID][i].Round < cp.Notifications[taskID][j].Round
 		})
+	}
+	for id, b := range snap.Branches {
+		cp.Branches[id] = cloneBranch(b)
+	}
+	for id, req := range snap.Merges {
+		cp.Merges[id] = cloneMergeRequest(req)
+	}
+	for id, v := range snap.MainlineVersions {
+		cp.MainlineVersions[id] = cloneMainlineVersion(v)
+	}
+	for taskID, head := range snap.MainlineHead {
+		cp.MainlineHead[taskID] = head
+	}
+	for taskID, seq := range snap.MergeSeq {
+		cp.MergeSeq[taskID] = seq
 	}
 	return cp
 }

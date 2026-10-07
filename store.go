@@ -32,11 +32,16 @@ func newFileStore(path string) *fileStore {
 
 // persistedSnapshot is the JSON encoding of a snapshot.
 type persistedSnapshot struct {
-	Version       int                        `json:"version"`
-	Tasks         map[string]*Task           `json:"tasks"`
-	Rounds        []*Round                   `json:"rounds"`
-	Manifests     map[string]*Manifest       `json:"manifests"`
-	Notifications map[string][]*Notification `json:"notifications"`
+	Version          int                         `json:"version"`
+	Tasks            map[string]*Task            `json:"tasks"`
+	Rounds           []*Round                    `json:"rounds"`
+	Manifests        map[string]*Manifest        `json:"manifests"`
+	Notifications    map[string][]*Notification  `json:"notifications"`
+	Branches         map[string]*Branch          `json:"branches"`
+	Merges           map[string]*MergeRequest    `json:"merges"`
+	MainlineVersions map[string]*MainlineVersion `json:"mainline_versions"`
+	MainlineHead     map[string]string           `json:"mainline_head"`
+	MergeSeq         map[string]int64            `json:"merge_seq"`
 }
 
 func (s *fileStore) load() (*snapshot, error) {
@@ -62,6 +67,21 @@ func (s *fileStore) load() (*snapshot, error) {
 		snap.Notifications = p.Notifications
 	}
 	snap.Rounds = p.Rounds
+	if p.Branches != nil {
+		snap.Branches = p.Branches
+	}
+	if p.Merges != nil {
+		snap.Merges = p.Merges
+	}
+	if p.MainlineVersions != nil {
+		snap.MainlineVersions = p.MainlineVersions
+	}
+	if p.MainlineHead != nil {
+		snap.MainlineHead = p.MainlineHead
+	}
+	if p.MergeSeq != nil {
+		snap.MergeSeq = p.MergeSeq
+	}
 	return snap, nil
 }
 
@@ -70,11 +90,16 @@ func (s *fileStore) save(snap *snapshot) error {
 		return fmt.Errorf("create state directory: %w", err)
 	}
 	p := persistedSnapshot{
-		Version:       1,
-		Tasks:         snap.Tasks,
-		Rounds:        snap.Rounds,
-		Manifests:     snap.Manifests,
-		Notifications: snap.Notifications,
+		Version:          1,
+		Tasks:            snap.Tasks,
+		Rounds:           snap.Rounds,
+		Manifests:        snap.Manifests,
+		Notifications:    snap.Notifications,
+		Branches:         snap.Branches,
+		Merges:           snap.Merges,
+		MainlineVersions: snap.MainlineVersions,
+		MainlineHead:     snap.MainlineHead,
+		MergeSeq:         snap.MergeSeq,
 	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {

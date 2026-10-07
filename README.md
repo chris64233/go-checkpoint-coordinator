@@ -69,6 +69,45 @@ pending ──全部成员上报──▶ completed（生成清单 + 完成通�
   用 `New(path)` 重新打开即可恢复；写入失败会回滚内存状态并向调用者返回错误，
   协调器不会对外暴露未持久化成功的状态。
 
+### 6. 分支检查点合并
+
+同一任务可以从一个**已确认**（completed）检查点分出多条处理分支，之后在严格条件下合并回
+主线。分支、合并申请与主线版本和轮次一样全部持久化，重启后继续有效。
+
+**建分支**：`CreateBranch(taskID, parentManifestID, branchNumber, Range{Start,End})`
+
+- 分支记录父检查点（清单 ID，即共同前缀锚点）、分支编号（同父下唯一）、半开处理范围
+  `[Start, End)` 和当前代次（创建时为 1）。
+- 父检查点未完成（pending / aborted / timed_out 或清单不存在）时返回
+  `ErrParentNotCompleted`，不能创建可发布分支；范围非法（Start>End）返回
+  `ErrInvalidRange`，同编号重复创建返回 `ErrBranchExists`。
+
+**分支上报**：`BranchReport(taskID, branchID, expectedGeneration, prefixDigest, tipPosition, tipDigest)`
+
+- 上报携带分支当前确认的共同前缀摘要和分支末端位置/摘要；成功一次代次加一。
+- 代次必须匹配：相同回执在同代次重放幂等返回（`Duplicate=true`）；旧代次回执返回
+  `ErrStaleBranch`，绝不会覆盖更新的分支状态。
+- 已合并分支的上报返回 `ErrBranchMerged`：旧分支回执不能回写主线。
+
+**合并申请**：`RequestMerge(mergeID, taskID, branchAID, branchBID)`
+
+- 合并前在同一把锁内**重新确认**两条分支：
+  - 共同前缀：父检查点必须相同，且双方上报确认的 `prefixDigest` 必须一致（未确认也算冲突）；
+  - 范围不重叠：两个半开区间必须不相交。
+- 任何差异都落到返回的 `MergeRequest.Conflicts` 中（`Status=conflicted`），冲突带
+  `Kind`（`prefix`/`range`）、两条分支 ID 和**具体位置**（如重叠区间 `[10,20)`、
+  分歧的两个前缀摘要），不静默覆盖任何一方；合并失败时两条分支原样保留、仍为 active，
+  修正后可用**新的合并号**再次申请。
+- `mergeID` 是幂等键：同一合并号用完全相同的分支、范围和代次（含参数顺序互换）重复
+  提交，返回**原结果**；分支前进过（新代次）或范围/分支发生变化则返回
+  `ErrMergeRequestChanged`。
+- 合并成功时生成唯一一个 `MainlineVersion`（ID 由合并内容确定性派生，主线代次单调
+  递增），两条分支置为 merged，该版本成为任务**唯一生效的主线版本**。
+
+**查询**：`GetLineage(taskID)` 返回父子检查点、各分支（含范围/代次/状态）、全部合并
+申请（含冲突位置）以及最终主线版本；检查点按轮次号、分支按代次做稳定排序。另有
+`GetBranch` / `GetMerge` / `GetMainlineVersion` 单项查询。
+
 ## 快速开始
 
 ```go
@@ -129,12 +168,19 @@ func main() {
 | `GetLatestRecoverableCheckpoint(taskID)` | 最新成功检查点（失败/pending 轮次不可见） |
 | `GetCheckpointHistory(taskID)` | 全部轮次历史（含清单与通知） |
 | `GetTask` / `GetRound` / `GetManifest` / `Notifications` | 单项查询 |
+| `CreateBranch(taskID, parentID, number, range)` | 从已确认检查点创建分支（父检查点、编号、范围、代次） |
+| `BranchReport(taskID, branchID, gen, prefix, pos, digest)` | 分支上报；代次 CAS、幂等、防陈旧回执 |
+| `RequestMerge(mergeID, taskID, branchA, branchB)` | 合并申请；共同前缀/不重叠校验、冲突定位、幂等、发布主线版本 |
+| `GetLineage(taskID)` | 父子检查点、分支范围、冲突位置与最终主线版本（按代次稳定排序） |
+| `GetBranch` / `GetMerge` / `GetMainlineVersion` | 分支/合并/主线版本单项查询 |
 
 ## 错误哨兵
 
 `ErrTaskExists`、`ErrTaskNotFound`、`ErrEmptyMembers`、`ErrRoundOpen`、`ErrNoRound`、
-`ErrUnknownMember`、`ErrStaleRound`、`ErrConflict`、`ErrAlreadyTerminal`，均可用
-`errors.Is` 判定。
+`ErrUnknownMember`、`ErrStaleRound`、`ErrConflict`、`ErrAlreadyTerminal`、
+`ErrBranchExists`、`ErrBranchNotFound`、`ErrInvalidRange`、`ErrParentNotCompleted`、
+`ErrBranchMerged`、`ErrStaleBranch`、`ErrMergeRequestChanged`、`ErrMergeSameBranch`、
+`ErrBranchPrefixUnconfirmed`，均可用 `errors.Is` 判定。
 
 ## 并发模型
 
@@ -143,6 +189,8 @@ func main() {
 
 - 最后一批并发上报只会产生一份清单、一条通知；
 - 中止/超时/最后上报竞争只保留一个终态；
+- 分支上报、合并申请与新检查点发布同样由这把锁串行化：一次成功合并恰好发布一个主线
+  版本；已合并分支拒绝后续回执，旧代次分支上报不能回写主线；
 - 查询不会读到迁移中途的状态；
 - 内存状态与磁盘状态不会出现“已返回成功但未落盘”的分歧。
 
@@ -156,3 +204,8 @@ go test -race -count=1 ./...
 8 成员 100 轮并发最后上报只完成一次（含持续读者校验无部分结果可见）、中止与最后上报
 200 轮竞争、超时与最后上报 200 轮竞争、懒超时与批量超时推进、失败轮次不作恢复点与
 历史查询、文件存储重启恢复、写入失败回滚等。
+分支合并方面覆盖：父检查点未完成禁止建分支、范围非法与分支号重复、分支代次推进/幂等
+重放/旧代次回执拒绝、共同前缀分歧与范围重叠的具体冲突定位、合并失败保留两条分支并用
+新合并号重试成功、同一合并号重复提交返回原结果（成功与冲突两种）、分支前进后同号冲突、
+40 对分支并发合并与迟到回执竞态下主线版本唯一生成且代次连续、合并状态与幂等结果落盘
+重启恢复等。
