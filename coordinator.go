@@ -463,6 +463,10 @@ func (c *Coordinator) completeLocked(r *Round, atMillis int64) {
 	c.snap.Manifests[id] = manifest
 	r.ManifestID = id
 	c.emitNotificationLocked(r, id)
+	// A completed round publishes the next single mainline version. The
+	// generation is assigned here under the same lock as the round
+	// transition, so concurrent merges can never publish a competing version.
+	c.publishRoundCheckpointLocked(r, manifest, atMillis)
 }
 
 // failRoundLocked moves a pending round to a failed terminal state (aborted or
